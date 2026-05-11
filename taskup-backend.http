@@ -1,0 +1,6 @@
+@taskup_backend_HostAddress = http://localhost:5143
+
+GET {{taskup_backend_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

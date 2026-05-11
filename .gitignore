@@ -1,0 +1,37 @@
+# Build folders
+bin/
+obj/
+
+# Visual Studio / IDE folders
+.vs/
+.vscode/
+.idea/
+*.user
+*.userosscache
+*.sln.docstates
+*.suo
+
+# NuGet Packages
+*.nupkg
+packages/
+
+# OS Files
+.DS_Store
+Thumbs.db
+
+# 🚨 SECURITY & SECRETS (Crucial for your app)
+# Ignore local development settings that contain your Compiler API Key
+appsettings.Development.json
+appsettings.Local.json
+appsettings.json
+secrets.json
+
+# Ignore Firebase Service Account JSON credentials
+firebase-credentials.json
+firebase-config.json
+firebase-admin.json
+*.pem
+*.key
+
+# Logs
+*.log
