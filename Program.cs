@@ -8,7 +8,7 @@ var builder = WebApplication.CreateBuilder(args);
 
 var frontendUrl = builder.Environment.IsDevelopment()
     ? "http://localhost:4200"
-    : "https://your-app-name.web.app"; // <-- You will get this URL in Step 4
+    : "https://taskup-9c09f.web.app"; // <-- You will get this URL in Step 4
 builder.Services.AddCors(options =>
 {
     options.AddPolicy("StrictPolicy", policy =>
