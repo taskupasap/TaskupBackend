@@ -27,20 +27,53 @@ builder.Services.AddSwaggerGen();
 // Register FirestoreService as a Singleton
 builder.Services.AddSingleton<FirestoreService>();
 builder.Services.AddSingleton<CloudinaryService>();
-// Initialize Firebase Admin SDK Safely
-var firebaseConfigPath = builder.Configuration["Firebase:ServiceAccountPath"] ?? "firebase-config.json";
 
-if (File.Exists(firebaseConfigPath))
+
+//// Initialize Firebase Admin SDK Safely
+//var firebaseConfigPath = builder.Configuration["Firebase:ServiceAccountPath"] ?? "firebase-config.json";
+
+//if (File.Exists(firebaseConfigPath))
+//{
+//    // The "Ghost" check: only create if it doesn't exist yet
+//    if (FirebaseAdmin.FirebaseApp.DefaultInstance == null)
+//    {
+//        FirebaseAdmin.FirebaseApp.Create(new FirebaseAdmin.AppOptions()
+//        {
+//            Credential = Google.Apis.Auth.OAuth2.GoogleCredential.FromFile(firebaseConfigPath)
+//        });
+//    }
+//}
+var firebaseProjectId = builder.Configuration["Firebase:ProjectId"];
+var firebaseJson = builder.Configuration["Firebase:ServiceAccountJson"];
+var firebasePath = builder.Configuration["Firebase:ServiceAccountPath"];
+
+GoogleCredential credential;
+
+// 1. Production: Try to read the raw JSON string from Render Environment Variables
+if (!string.IsNullOrEmpty(firebaseJson))
 {
-    // The "Ghost" check: only create if it doesn't exist yet
-    if (FirebaseAdmin.FirebaseApp.DefaultInstance == null)
-    {
-        FirebaseAdmin.FirebaseApp.Create(new FirebaseAdmin.AppOptions()
-        {
-            Credential = Google.Apis.Auth.OAuth2.GoogleCredential.FromFile(firebaseConfigPath)
-        });
-    }
+    credential = GoogleCredential.FromJson(firebaseJson);
 }
+// 2. Local Development: Fall back to reading the physical file path
+else if (!string.IsNullOrEmpty(firebasePath))
+{
+    credential = GoogleCredential.FromFile(firebasePath);
+}
+else
+{
+    throw new Exception("Firebase credentials are missing! Please set Firebase:ServiceAccountJson or Firebase:ServiceAccountPath.");
+}
+
+// THE FIX: Prevent fatal crashes by checking if Firebase is already running
+if (FirebaseApp.DefaultInstance == null)
+{
+    FirebaseApp.Create(new AppOptions
+    {
+        Credential = credential,
+        ProjectId = firebaseProjectId
+    });
+}
+
 
 var app = builder.Build();
 
