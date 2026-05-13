@@ -39,4 +39,34 @@ public class UsersController : ControllerBase
 
         return Ok(leaderboard);
     }
+    [HttpPost("join-workspace")]
+    public async Task<IActionResult> JoinWorkspace([FromBody] Dictionary<string, string> request)
+    {
+        // 1. Get the logged-in user
+        var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(userId)) return Unauthorized("User not logged in.");
+
+        if (!request.ContainsKey("orgId") || string.IsNullOrEmpty(request["orgId"]))
+            return BadRequest("Organization ID is required.");
+
+        string orgIdToJoin = request["orgId"].Trim();
+
+        // 2. (Optional but recommended) Verify the Org actually exists!
+        // var orgRef = _firestore.Collection("organizations").Document(orgIdToJoin);
+        // var orgSnap = await orgRef.GetSnapshotAsync();
+        // if (!orgSnap.Exists) return NotFound("Workspace not found. Check your invite code.");
+
+        // 3. Update the User's profile with their new Workspace ID
+        var userRef = _firestore.Collection("users").Document(userId);
+
+        var updates = new Dictionary<string, object>
+        {
+            { "orgId", orgIdToJoin },
+            { "workspaceType", "company" } // Defaulting to company, could be dynamically pulled from the org document
+        };
+
+        await userRef.UpdateAsync(updates);
+
+        return Ok(new { message = "Successfully joined the workspace!", orgId = orgIdToJoin });
+    }
 }

@@ -6,16 +6,20 @@ using taskup_backend.Services;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// 1. Configure CORS
+var frontendUrl = builder.Environment.IsDevelopment()
+    ? "http://localhost:4200"
+    : "https://your-app-name.web.app"; // <-- You will get this URL in Step 4
 builder.Services.AddCors(options =>
 {
-    options.AddPolicy("AllowAngular", policy =>
+    options.AddPolicy("StrictPolicy", policy =>
     {
-        policy.WithOrigins("http://localhost:4200") // Your frontend URL
+        policy.WithOrigins(frontendUrl)
               .AllowAnyHeader()
-              .AllowAnyMethod();
+              .AllowAnyMethod()
+              .AllowCredentials(); // Required if using secure cookies/tokens
     });
 });
+
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
@@ -47,7 +51,7 @@ if (app.Environment.IsDevelopment())
 }
 
 app.UseHttpsRedirection();
-app.UseCors("AllowAngular");
+app.UseCors("StrictPolicy"); // Apply the lock!
 
 // 3. Custom Firebase Auth Middleware
 app.UseMiddleware<FirebaseAuthMiddleware>();

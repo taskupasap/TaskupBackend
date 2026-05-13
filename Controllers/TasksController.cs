@@ -21,19 +21,93 @@ public class TasksController : ControllerBase
     }
 
     [HttpGet("{orgId}")]
-    public async Task<IActionResult> GetTasks(string orgId)
+    public async Task<IActionResult> GetTasks(string orgId, [FromQuery] string userId = null)
     {
+        var currentUserId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        var targetUserId = userId ?? currentUserId;
+
         var query = _firestore.Collection("tasks").WhereEqualTo("orgId", orgId);
         var snapshot = await query.GetSnapshotAsync();
 
-        var tasks = snapshot.Documents.Select(doc =>
-        {
-            var task = doc.ConvertTo<TaskItem>();
-            task.Id = doc.Id;
-            return task;
-        }).ToList();
+        var tasksList = new List<Dictionary<string, object>>();
 
-        return Ok(tasks);
+        foreach (var doc in snapshot.Documents)
+        {
+            var taskDict = doc.ToDictionary();
+            taskDict["id"] = doc.Id;
+            if (!taskDict.ContainsKey("status")) taskDict["status"] = taskDict.ContainsKey("Status") ? taskDict["Status"] : "todo";
+
+            tasksList.Add(taskDict);
+        }
+
+        // =========================================================================
+        // 🚨 THE NUCLEAR FIX: IN-MEMORY COUNTER
+        // Bypasses Firestore query rules to guarantee every attempt is counted!
+        // =========================================================================
+        var allAttemptsSnap = await _firestore.Collection("taskAttempts").GetSnapshotAsync();
+        var reviewCounts = new Dictionary<string, int>();
+
+        foreach (var doc in allAttemptsSnap.Documents)
+        {
+            // Extract Task ID safely
+            string tId = doc.ContainsField("TaskId") ? doc.GetValue<string>("TaskId") :
+                         doc.ContainsField("taskId") ? doc.GetValue<string>("taskId") : "";
+
+            // Extract Status safely and clean it
+            string rawStatus = doc.ContainsField("Status") ? doc.GetValue<string>("Status") :
+                               doc.ContainsField("status") ? doc.GetValue<string>("status") : "";
+
+            string cleanStatus = rawStatus?.Trim().ToLower();
+
+            // Explicitly count any attempt sitting in "review"
+            if (!string.IsNullOrEmpty(tId) && cleanStatus == "review")
+            {
+                if (!reviewCounts.ContainsKey(tId)) reviewCounts[tId] = 0;
+                reviewCounts[tId]++;
+            }
+        }
+
+        // Inject the TRUE count explicitly as an integer
+        foreach (var task in tasksList)
+        {
+            string tId = task["id"].ToString();
+            task["pendingReviewCount"] = reviewCounts.ContainsKey(tId) ? reviewCounts[tId] : 0;
+        }
+
+        // =========================================================================
+        // OVERLAY STUDENT PROGRESS (Existing Logic)
+        // =========================================================================
+        if (!string.IsNullOrEmpty(targetUserId))
+        {
+            var attemptsQuery = await _firestore.Collection("taskAttempts")
+                .WhereEqualTo("UserId", targetUserId)
+                .GetSnapshotAsync();
+
+            var userAttempts = new Dictionary<string, DocumentSnapshot>();
+            foreach (var doc in attemptsQuery.Documents)
+            {
+                string tId = doc.ContainsField("TaskId") ? doc.GetValue<string>("TaskId") :
+                             doc.ContainsField("taskId") ? doc.GetValue<string>("taskId") : "";
+
+                if (!string.IsNullOrEmpty(tId)) userAttempts[tId] = doc;
+            }
+
+            foreach (var task in tasksList)
+            {
+                string tId = task["id"].ToString();
+
+                if (userAttempts.TryGetValue(tId, out var attemptDoc))
+                {
+                    string attemptStatus = attemptDoc.ContainsField("Status") ? attemptDoc.GetValue<string>("Status") :
+                                           attemptDoc.ContainsField("status") ? attemptDoc.GetValue<string>("status") : "todo";
+
+                    task["status"] = attemptStatus;
+                    task["attemptId"] = attemptDoc.Id;
+                }
+            }
+        }
+
+        return Ok(tasksList);
     }
 
     [HttpPost]
@@ -64,53 +138,91 @@ public class TasksController : ControllerBase
             { "readContent", request.ReadContent ?? "" },
 
             // Quiz spec (Firestore natively handles nested objects/lists)
-            { "questions", request.Questions ?? new List<QuizQuestion>() }
+            // Quiz Specific
+            { "questions", request.Questions ?? new List<QuizQuestion>() },
+            { "xpPerQuestion", request.XpPerQuestion > 0 ? request.XpPerQuestion : 10 }, // 🚨 Never allow 0 XP per question!
+            { "pendingReviewCount", 0 }, // 🚨 FIX 1: Always start the counter at 0!
         };
 
         await taskRef.SetAsync(taskData);
         return Ok(taskData);
     }
 
-    [HttpPatch("{id}/status")]
-    public async Task<IActionResult> UpdateStatus(string id, [FromBody] string status)
+    [HttpPatch("{taskId}/status")]
+    public async Task<IActionResult> UpdateStatus(string taskId, [FromBody] string status)
     {
-        // 1. Get the User ID from the Firebase Token (set by our Middleware)
+        // 1. Get the current User ID from the token
         var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(userId)) return Unauthorized("User not authenticated.");
 
-        var taskRef = _firestore.Collection("tasks").Document(id);
-        var taskSnap = await taskRef.GetSnapshotAsync();
+        // Clean the status string just in case it has extra JSON quotes
+        status = status?.Trim('"');
 
-        if (!taskSnap.Exists) return NotFound("Task not found");
+        // 2. Query the student's personal attempt using the Task ID + User ID!
+        var attemptsQuery = await _firestore.Collection("taskAttempts")
+            .WhereEqualTo("TaskId", taskId)
+            .WhereEqualTo("UserId", userId)
+            .GetSnapshotAsync();
 
-        var currentStatus = taskSnap.ContainsField("status") ? taskSnap.GetValue<string>("status") : "";
+        DocumentReference attemptRef;
+        string currentStatus = "";
 
-        // 2. Update the Task Status
-        await taskRef.UpdateAsync("status", status);
-
-        // 3. GAMIFICATION LOGIC: Award XP if moving to "completed"
-        if (status == "completed" && currentStatus != "completed" && !string.IsNullOrEmpty(userId))
+        if (attemptsQuery.Documents.Count > 0)
         {
-            int xpReward = taskSnap.ContainsField("xpReward") ? taskSnap.GetValue<int>("xpReward") : 50; // Default 50 XP
+            var attemptDoc = attemptsQuery.Documents[0];
+            attemptRef = attemptDoc.Reference;
+            currentStatus = attemptDoc.ContainsField("Status") ? attemptDoc.GetValue<string>("Status") : "";
+        }
+        else
+        {
+            // Create their personal attempt document if it doesn't exist yet!
+            var newAttempt = new Dictionary<string, object>
+            {
+                { "TaskId", taskId },
+                { "UserId", userId },
+                { "Status", status },
+                { "status", status }, // camelCase for UI binding
+                { "StartedAt", Timestamp.GetCurrentTimestamp() }
+            };
+            attemptRef = await _firestore.Collection("taskAttempts").AddAsync(newAttempt);
+        }
+
+        // 3. Update the student's Attempt Status
+        await attemptRef.UpdateAsync(new Dictionary<string, object> {
+            { "Status", status },
+            { "status", status }
+        });
+
+        // 🚨 FIX 2: Dynamic Counter for Drag-and-Drop!
+        var taskRefMaster = _firestore.Collection("tasks").Document(taskId);
+
+        if (status.ToLower() == "review" && currentStatus.ToLower() != "review")
+        {
+            await taskRefMaster.UpdateAsync("pendingReviewCount", Google.Cloud.Firestore.FieldValue.Increment(1));
+        }
+        else if (status.ToLower() != "review" && currentStatus.ToLower() == "review")
+        {
+            await taskRefMaster.UpdateAsync("pendingReviewCount", Google.Cloud.Firestore.FieldValue.Increment(-1));
+        }
+
+        // 4. GAMIFICATION LOGIC: Award XP if dragged to "completed" manually
+        if (status?.ToLower() == "completed" && currentStatus?.ToLower() != "completed")
+        {
+            var taskSnap = await taskRefMaster.GetSnapshotAsync();
+            int xpReward = taskSnap.Exists && taskSnap.ContainsField("xpReward") ? taskSnap.GetValue<int>("xpReward") : 50;
 
             var userRef = _firestore.Collection("users").Document(userId);
             var userSnap = await userRef.GetSnapshotAsync();
 
             if (userSnap.Exists)
             {
-                int currentXp = userSnap.ContainsField("xp") ? userSnap.GetValue<int>("xp") : 0;
-                int newXp = currentXp + xpReward;
-                int newLevel = (newXp / 500) + 1; // Level up every 500 XP
-
-                // Update the user's profile with new stats
-                await userRef.UpdateAsync(new Dictionary<string, object>
-                {
-                    { "xp", newXp },
-                    { "level", newLevel }
-                });
+                string userXpField = userSnap.ContainsField("totalXp") ? "totalXp" :
+                                     userSnap.ContainsField("xp") ? "xp" : "Xp";
+                await userRef.UpdateAsync(userXpField, Google.Cloud.Firestore.FieldValue.Increment(xpReward));
             }
         }
 
-        return Ok();
+        return Ok(new { message = "Progress updated successfully." });
     }
 
     [HttpPut("{id}")]
@@ -150,25 +262,41 @@ public class TasksController : ControllerBase
     [HttpPost("{taskId}/start")]
     public async Task<IActionResult> StartTaskAttempt(string taskId, [FromBody] string userId)
     {
-        // 1. Check if an attempt already exists for THIS user and THIS task
+        if (string.IsNullOrEmpty(userId)) return BadRequest("UserId is required to start a task.");
+
+        // 1. 🚨 MATCH FIRESTORE CASING: Search using PascalCase fields
         var attemptsQuery = await _firestore.Collection("taskAttempts")
-            .WhereEqualTo("taskId", taskId)
-            .WhereEqualTo("userId", userId)
+            .WhereEqualTo("TaskId", taskId)
+            .WhereEqualTo("UserId", userId)
             .GetSnapshotAsync();
+
+        // Fallback for old camelCase data (just in case)
+        if (attemptsQuery.Documents.Count == 0)
+        {
+            attemptsQuery = await _firestore.Collection("taskAttempts")
+                .WhereEqualTo("taskId", taskId)
+                .WhereEqualTo("userId", userId)
+                .GetSnapshotAsync();
+        }
 
         if (attemptsQuery.Documents.Count > 0)
         {
-            // They already started it, return the existing attempt ID
-            return Ok(new { attemptId = attemptsQuery.Documents[0].Id, status = attemptsQuery.Documents[0].GetValue<string>("status") });
+            // They already started it, return the existing attempt ID safely!
+            var existingDoc = attemptsQuery.Documents[0];
+            string currentStatus = existingDoc.ContainsField("Status") ? existingDoc.GetValue<string>("Status") :
+                                   existingDoc.ContainsField("status") ? existingDoc.GetValue<string>("status") : "in-progress";
+
+            return Ok(new { attemptId = existingDoc.Id, status = currentStatus });
         }
 
-        // 2. 🚨 THE FIX: Create a personal copy (Attempt) for this specific user
+        // 2. 🚨 CREATE SAFELY: Use PascalCase to match your Firestore TaskAttempt model perfectly
         var newAttempt = new Dictionary<string, object>
         {
-            { "taskId", taskId },
-            { "userId", userId },
-            { "status", "in-progress" }, // Only their attempt is in-progress!
-            { "startedAt", Timestamp.GetCurrentTimestamp() }
+            { "TaskId", taskId },
+            { "UserId", userId },
+            { "Status", "in-progress" },
+            { "status", "in-progress" }, // Keep camelCase for UI bindings
+            { "StartedAt", Timestamp.GetCurrentTimestamp() }
         };
 
         var docRef = await _firestore.Collection("taskAttempts").AddAsync(newAttempt);
@@ -176,47 +304,68 @@ public class TasksController : ControllerBase
         return Ok(new { attemptId = docRef.Id, status = "in-progress" });
     }
 
-    [HttpPost("attempts/{attemptId}/submit")]
-    public async Task<IActionResult> SubmitTaskAttempt(string attemptId, [FromBody] SubmitRequest request)
+    [HttpPost("attempts/{attemptIdOrTaskId}/submit")]
+    public async Task<IActionResult> SubmitTaskAttempt(string attemptIdOrTaskId, [FromBody] SubmitRequest request)
     {
-        // 1. Point to both potential collections
-        var taskRef = _firestore.Collection("tasks").Document(attemptId);
-        var attemptRef = _firestore.Collection("taskAttempts").Document(attemptId);
-        DocumentReference targetRef = null;
+        // 1. Get the logged-in student's ID
+        var userId = User.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+        if (string.IsNullOrEmpty(userId)) return Unauthorized("User not logged in.");
 
-        // 2. Find out where this document actually lives
-        var taskSnap = await taskRef.GetSnapshotAsync();
-        if (taskSnap.Exists)
+        DocumentSnapshot attemptSnap = null;
+        DocumentReference attemptRef = null;
+
+        // 2. Try to find the document assuming they passed a valid Attempt ID
+        attemptRef = _firestore.Collection("taskAttempts").Document(attemptIdOrTaskId);
+        attemptSnap = await attemptRef.GetSnapshotAsync();
+
+        // 3. SMART FALLBACK: If not found, they passed the Task ID! Find this user's attempt for this task.
+        if (!attemptSnap.Exists)
         {
-            targetRef = taskRef; // It's in the tasks collection!
-        }
-        else
-        {
-            var attemptSnap = await attemptRef.GetSnapshotAsync();
-            if (attemptSnap.Exists)
+            var query = _firestore.Collection("taskAttempts")
+                .WhereEqualTo("TaskId", attemptIdOrTaskId)
+                .WhereEqualTo("UserId", userId);
+
+            var querySnap = await query.GetSnapshotAsync();
+            if (querySnap.Documents.Count > 0)
             {
-                targetRef = attemptRef; // It's in the taskAttempts collection!
+                attemptSnap = querySnap.Documents[0];
+                attemptRef = attemptSnap.Reference;
             }
         }
 
-        // 3. If we STILL can't find it, return a clean 404 instead of crashing
-        if (targetRef == null)
+        if (attemptSnap == null || !attemptSnap.Exists)
         {
-            return NotFound($"Could not find a task or attempt matching ID: {attemptId}");
+            return NotFound($"No active student attempt found for Task/Attempt ID: {attemptIdOrTaskId}");
         }
 
-        // 4. We found it! Save the code and move it to the Review column
+        var attemptData = attemptSnap.ToDictionary();
+        string taskId = attemptData.ContainsKey("TaskId") ? attemptData["TaskId"].ToString() :
+                        attemptData.ContainsKey("taskId") ? attemptData["taskId"].ToString() : attemptIdOrTaskId;
+
+        var taskRef = _firestore.Collection("tasks").Document(taskId);
+        var taskSnap = await taskRef.GetSnapshotAsync();
+
+        if (!taskSnap.Exists) return NotFound("The master task template has been deleted.");
+
+        // 4. Save the student's answers (Course verification string, Quiz JSON, or Code)
         var updates = new Dictionary<string, object>
         {
-            { "status", "review" },
-            { "submittedAt", DateTime.UtcNow },
-            { "codePayload", request.CodePayload ?? "" },
-            { "language", request.Language ?? "javascript" }
+            { "SubmittedAt", DateTime.UtcNow },
+            { "CodePayload", request.CodePayload ?? "" },
+            { "codePayload", request.CodePayload ?? "" }, // UI compat
+            { "Language", request.Language ?? "javascript" },
+            { "Status", "review" },
+            { "status", "review" }
         };
 
-        await targetRef.UpdateAsync(updates);
-        return Ok(new { message = "Task successfully submitted for Admin review." });
+        await attemptRef.UpdateAsync(updates);
+
+        // 5. Increment the Notification Counter on the Master Task for the Admin!
+        await taskRef.UpdateAsync("pendingReviewCount", Google.Cloud.Firestore.FieldValue.Increment(1));
+
+        return Ok(new { message = "Successfully submitted for Admin review.", status = "review" });
     }
+
     [HttpGet("languages")]
     public IActionResult GetSupportedLanguages()
     {
@@ -238,66 +387,64 @@ public class TasksController : ControllerBase
     [HttpPost("attempts/{attemptId}/approve")]
     public async Task<IActionResult> ApproveAttemptAndGrantXp(string attemptId, [FromBody] ApproveRequest request)
     {
-        // 1. Find the attempt or task
-        var attemptRef = _firestore.Collection("taskAttempts").Document(attemptId);
-        var snapshot = await attemptRef.GetSnapshotAsync();
+        if (string.IsNullOrEmpty(request.StudentId))
+            return BadRequest("StudentId is required to approve the correct submission.");
 
-        if (!snapshot.Exists)
+        DocumentSnapshot attemptSnap = null;
+        DocumentReference attemptRef = null;
+
+        attemptRef = _firestore.Collection("taskAttempts").Document(attemptId);
+        attemptSnap = await attemptRef.GetSnapshotAsync();
+
+        // 🚨 FALLBACK: Query by TaskId AND StudentId to find the exact submission!
+        if (!attemptSnap.Exists)
         {
-            // Fallback to global tasks
-            attemptRef = _firestore.Collection("tasks").Document(attemptId);
-            snapshot = await attemptRef.GetSnapshotAsync();
-            if (!snapshot.Exists) return NotFound("Task not found");
-        }
+            var query = _firestore.Collection("taskAttempts")
+                .WhereEqualTo("TaskId", attemptId)
+                .WhereEqualTo("UserId", request.StudentId)
+                .WhereEqualTo("Status", "review");
 
-        // 2. 🚨 THE FIX: Safely extract the UserId handling both camelCase and Arrays!
-        string userId = null;
-        string fieldName = snapshot.ContainsField("assignedTo") ? "assignedTo" :
-                           snapshot.ContainsField("AssignedTo") ? "AssignedTo" : null;
-
-        if (fieldName == null)
-        {
-            return BadRequest("Task does not have an assigned user.");
-        }
-
-        try
-        {
-            // Since we updated Angular to send arrays (e.g., ["user123"]), read it as a List
-            var userIds = snapshot.GetValue<List<string>>(fieldName);
-            if (userIds != null && userIds.Count > 0)
+            var querySnap = await query.GetSnapshotAsync();
+            if (querySnap.Documents.Count > 0)
             {
-                userId = userIds[0]; // Grab the first assigned user
+                attemptSnap = querySnap.Documents[0];
+                attemptRef = attemptSnap.Reference;
             }
         }
-        catch
+
+        if (attemptSnap == null || !attemptSnap.Exists)
+            return NotFound("Student submission record not found.");
+
+        // Lock attempt status to completed
+        await attemptRef.UpdateAsync(new Dictionary<string, object> {
+            { "Status", "completed" },
+            { "status", "completed" },
+            { "earnedXp", request.XpReward }
+        });
+
+        // 🚨 ADD THIS: Decrement the notification counter on the Master Task!
+        var attemptData = attemptSnap.ToDictionary();
+        string taskId = attemptData.ContainsKey("TaskId") ? attemptData["TaskId"].ToString() :
+                        attemptData.ContainsKey("taskId") ? attemptData["taskId"].ToString() : "";
+
+        if (!string.IsNullOrEmpty(taskId))
         {
-            // Fallback: If it's an old task saved as a single string
-            userId = snapshot.GetValue<string>(fieldName);
+            var taskRefToUpdate = _firestore.Collection("tasks").Document(taskId);
+            await taskRefToUpdate.UpdateAsync("pendingReviewCount", Google.Cloud.Firestore.FieldValue.Increment(-1));
         }
 
-        if (string.IsNullOrEmpty(userId))
-        {
-            return BadRequest("Could not parse assigned user ID.");
-        }
-
-        // 3. Lock the task
-        await attemptRef.UpdateAsync("status", "completed"); // Save back as camelCase for Angular!
-
-        // 4. Auto-Deposit the XP
-        var userRef = _firestore.Collection("users").Document(userId);
+        // Grant the XP directly to the student
+        var userRef = _firestore.Collection("users").Document(request.StudentId);
         var userSnap = await userRef.GetSnapshotAsync();
 
         if (userSnap.Exists)
         {
-            // Handle case sensitivity for the XP field as well
-            string xpField = userSnap.ContainsField("xp") ? "xp" :
-                             userSnap.ContainsField("Xp") ? "Xp" : "xp";
-
-            int currentXp = userSnap.ContainsField(xpField) ? userSnap.GetValue<int>(xpField) : 0;
-            await userRef.UpdateAsync(xpField, currentXp + request.XpReward);
+            string userXpField = userSnap.ContainsField("totalXp") ? "totalXp" :
+                                 userSnap.ContainsField("xp") ? "xp" : "Xp";
+            await userRef.UpdateAsync(userXpField, Google.Cloud.Firestore.FieldValue.Increment(request.XpReward));
         }
 
-        return Ok(new { message = $"Granted {request.XpReward} XP to {userId}." });
+        return Ok(new { message = $"Successfully granted {request.XpReward} XP." });
     }
 
     [HttpPost("attempts/{attemptId}/run")]
@@ -362,21 +509,83 @@ public class TasksController : ControllerBase
         }
     }
     // 🚨 THE FIX: Added "detail/" to make the route unique!
-    // 🚨 THE FIX: Added "detail/" to make the route unique!
     [HttpGet("detail/{id}")]
     public async Task<IActionResult> GetTaskById(string id)
     {
+        // 1. Try to fetch it directly as a Master Task
         var taskRef = _firestore.Collection("tasks").Document(id);
         var snapshot = await taskRef.GetSnapshotAsync();
 
-        if (!snapshot.Exists)
+        if (snapshot.Exists)
         {
-            var attemptRef = _firestore.Collection("taskAttempts").Document(id);
-            snapshot = await attemptRef.GetSnapshotAsync();
-            if (!snapshot.Exists) return NotFound();
+            var taskData = snapshot.ToDictionary();
+            taskData["id"] = snapshot.Id;
+            return Ok(taskData);
         }
 
-        return Ok(snapshot.ToDictionary());
+        // 2. If it's not a Master Task, it must be an Attempt ID!
+        var attemptRef = _firestore.Collection("taskAttempts").Document(id);
+        var attemptSnap = await attemptRef.GetSnapshotAsync();
+
+        if (!attemptSnap.Exists) return NotFound("Task or Attempt not found.");
+
+        var attemptData = attemptSnap.ToDictionary();
+        string masterTaskId = attemptData.ContainsKey("TaskId") ? attemptData["TaskId"].ToString() :
+                              attemptData.ContainsKey("taskId") ? attemptData["taskId"].ToString() : "";
+
+        // 3. Fetch the underlying Master Task to get the Starting Code & Description
+        var masterTaskRef = _firestore.Collection("tasks").Document(masterTaskId);
+        var masterSnap = await masterTaskRef.GetSnapshotAsync();
+
+        if (!masterSnap.Exists) return NotFound("The master task template has been deleted.");
+
+        var resultData = masterSnap.ToDictionary();
+        resultData["id"] = masterSnap.Id; // Keep master ID
+        resultData["attemptId"] = attemptSnap.Id; // Expose the specific student attempt ID
+
+        // 4. OVERLAY PRIORITY: Apply the student's saved work over the starting template
+        string savedCode = attemptData.ContainsKey("codePayload") ? attemptData["codePayload"].ToString() :
+                           attemptData.ContainsKey("CodePayload") ? attemptData["CodePayload"].ToString() : null;
+
+        if (!string.IsNullOrEmpty(savedCode))
+        {
+            resultData["codePayload"] = savedCode;
+        }
+
+        // 5. Apply the student's specific status & language
+        resultData["status"] = attemptData.ContainsKey("Status") ? attemptData["Status"].ToString() :
+                               attemptData.ContainsKey("status") ? attemptData["status"].ToString() : "todo";
+
+        resultData["language"] = attemptData.ContainsKey("Language") ? attemptData["Language"].ToString() :
+                                 attemptData.ContainsKey("language") ? attemptData["language"].ToString() : "Unknown";
+
+        // 🚨 THE FIX: Safely calculate exactly how long the task took!
+        DateTime? startedAt = null;
+        if (attemptData.TryGetValue("StartedAt", out var s1) || attemptData.TryGetValue("startedAt", out s1))
+        {
+            if (s1 is Google.Cloud.Firestore.Timestamp ts1) startedAt = ts1.ToDateTime();
+            else if (s1 is DateTime dt1) startedAt = dt1;
+        }
+
+        DateTime? submittedAt = null;
+        if (attemptData.TryGetValue("SubmittedAt", out var s2) || attemptData.TryGetValue("submittedAt", out s2))
+        {
+            if (s2 is Google.Cloud.Firestore.Timestamp ts2) submittedAt = ts2.ToDateTime();
+            else if (s2 is DateTime dt2) submittedAt = dt2;
+        }
+
+        if (startedAt.HasValue && submittedAt.HasValue)
+        {
+            TimeSpan duration = submittedAt.Value - startedAt.Value;
+            // Format to "XXm YYs"
+            resultData["timeTaken"] = $"{(int)duration.TotalMinutes}m {duration.Seconds}s";
+        }
+        else
+        {
+            resultData["timeTaken"] = "Unknown";
+        }
+
+        return Ok(resultData);
     }
 
     [HttpPost("attempts/{attemptId}/evaluate-quiz")]
@@ -434,7 +643,11 @@ public class TasksController : ControllerBase
 
         // Deserialize the task questions securely matching your C# model
         var questions = taskSnap.GetValue<List<QuizQuestion>>("questions");
-        int xpPerQuestion = taskSnap.ContainsField("xpPerQuestion") ? taskSnap.GetValue<int>("xpPerQuestion") : 0;
+        // 🚨 CRITICAL FIX: Safely read XP Per Question and ensure it never defaults to 0!
+        int xpPerQuestion = taskSnap.ContainsField("xpPerQuestion") ? taskSnap.GetValue<int>("xpPerQuestion") :
+                            taskSnap.ContainsField("XpPerQuestion") ? taskSnap.GetValue<int>("XpPerQuestion") : 10;
+
+        if (xpPerQuestion <= 0) xpPerQuestion = 10; // Failsafe!
 
         // 5. Parse Student Answers (stored in camelCase codePayload from your Angular submit)
         string payloadField = attemptData.ContainsKey("codePayload") ? "codePayload" :
@@ -471,6 +684,9 @@ public class TasksController : ControllerBase
             { "score", $"{correctCount}/{questions.Count}" }
         };
         await attemptRef.UpdateAsync(updates);
+
+        // 🚨 ADD THIS: Decrement the notification counter on the Master Task!
+        await taskRef.UpdateAsync("pendingReviewCount", Google.Cloud.Firestore.FieldValue.Increment(-1));
 
         // 8. Add XP to the User's Total Profile (Using Firestore's thread-safe atomic Incrementer)
         var userRef = _firestore.Collection("users").Document(userId);
@@ -514,6 +730,7 @@ public class TasksController : ControllerBase
 public class ApproveRequest
 {
     public int XpReward { get; set; }
+    public string StudentId { get; set; } // 🚨 ADDED: Identify the correct student
 }
 public class SubmitRequest
 {
@@ -526,3 +743,7 @@ public class RunCodeRequest
     public string CompilerId { get; set; } // e.g., "python-3.14"
 }
 // 🚨 THE FIX: Paste this at the bottom of TasksController.cs
+public class StatusUpdateRequest
+{
+    public string Status { get; set; }
+}
