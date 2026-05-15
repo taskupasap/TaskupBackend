@@ -11,20 +11,44 @@ public class FirestoreService
 
     public FirestoreService(IConfiguration config)
     {
-        string projectId = config["Firebase:ProjectId"] ?? throw new Exception("Firebase ProjectId missing in appsettings");
-        string configPath = config["Firebase:ServiceAccountPath"] ?? "firebase-config.json";
+        var projectId = config["Firebase:ProjectId"];
+        var firebaseJson = config["Firebase:ServiceAccountJson"];
+        var firebasePath = config["Firebase:ServiceAccountPath"];
 
-        // Build the Firestore client using the explicit service account file
-        FirestoreDbBuilder builder = new FirestoreDbBuilder
+        GoogleCredential credential;
+
+        // 1. Production (Render): Read raw JSON string from Environment Variables
+        if (!string.IsNullOrEmpty(firebaseJson))
+        {
+            credential = GoogleCredential.FromJson(firebaseJson);
+        }
+        // 2. Local Development: Read from physical file path
+        else if (!string.IsNullOrEmpty(firebasePath))
+        {
+            credential = GoogleCredential.FromFile(firebasePath);
+        }
+        else
+        {
+            // Ultimate fallback for local testing
+            credential = GoogleCredential.FromFile("firebase-config.json");
+        }
+
+        // Build the Firestore Database connection securely
+        var builder = new FirestoreDbBuilder
         {
             ProjectId = projectId,
-            Credential = GoogleCredential.FromFile(configPath)
+            Credential = credential
         };
 
         _db = builder.Build();
     }
+    // Expose the Collection method so your Controllers can use it
+    public CollectionReference Collection(string path)
+    {
+        return _db.Collection(path);
+    }
 
-    public CollectionReference Collection(string name) => _db.Collection(name);
+    //public CollectionReference Collection(string name) => _db.Collection(name);
 
     // Helper to get a specific document reference
     public DocumentReference Document(string collection, string documentId) => _db.Collection(collection).Document(documentId);
