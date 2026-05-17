@@ -33,12 +33,15 @@ public class UsersController : ControllerBase
             level = doc.ContainsField("level") ? doc.GetValue<int>("level") : 1,
             role = doc.ContainsField("role") ? doc.GetValue<string>("role") : "member"
         })
+        // 🚨 THE FIX: Filter out any user who has the 'admin' role!
+        .Where(u => u.role.ToLower() != "admin")
         .OrderByDescending(u => u.xp) // 3. Sort in-memory instead of in the database
         .Take(50)
         .ToList();
 
         return Ok(leaderboard);
     }
+
     [HttpPost("join-workspace")]
     public async Task<IActionResult> JoinWorkspace([FromBody] Dictionary<string, string> request)
     {
